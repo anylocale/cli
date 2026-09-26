@@ -1,0 +1,981 @@
+#!/bin/sh
+# pull-strings.sh - the countrymanager CLI and the anylocale CLI: POSIX sh +
+# curl only, so it can be vendored into any repo and run from CI or an Xcode
+# build phase.
+#
+# ONE file, two products. The brand comes from the name the script is invoked
+# under - `anylocale` or `anylocale.sh` is anylocale, anything else is
+# countrymanager - so a symlink or a renamed copy is the whole of the second
+# CLI. `ANYLOCALE_CLI=1` forces it, which is what `sh pull-strings.sh` needs.
+#
+# countrymanager groups commands under one namespace per product area; `loc` is
+# localization, and further areas (reviews, ...) will claim their own as their
+# APIs land. anylocale is localization alone, so there `loc` is optional:
+# `anylocale sync` and `anylocale loc sync` are the same command.
+#
+# Usage (countrymanager spellings; drop the `loc` under anylocale):
+#   ./pull-strings.sh loc login  [--project <slug>]  # prompt for a token, store it
+#   ./pull-strings.sh loc logout [--project <slug>]  # remove the stored token again
+#   ./pull-strings.sh loc sync --project <slug> --out-dir <dir> [--no-comments] [--platform <ios|android|api>]
+#   ./pull-strings.sh loc keys list   --project <slug> [--platform <ios|android|api>]
+#   ./pull-strings.sh loc keys create --project <slug> --name <key> [options]
+#   ./pull-strings.sh loc keys update --project <slug> --name <key> [options]
+#   ./pull-strings.sh loc keys delete --project <slug> --name <key> [--yes]
+#   ./pull-strings.sh loc pull  --project <slug> --locale <code> --format <fmt> [--tag <name>] [--out <path>]
+#   ./pull-strings.sh loc tags list --project <slug>
+#
+# `loc sync` downloads every locale and every string table of a localization
+# project as <code>.lproj/<Name>.strings (+ .stringsdict where plurals
+# exist). The pre-namespace spellings keep working as aliases:
+# `--project ... --out-dir ...` at top level means `loc sync`, and a bare
+# `keys ...` means `loc keys ...`.
+#
+# Key options: --description <text> --table <name> --plural --max-length <n> --tags <a,b>
+#              --add-tag <name> / --remove-tag <name> (update only, repeatable)
+# `--platform` serves the keys that build ships: everything except the keys
+# tagged for a different platform. An untagged key ships everywhere.
+# The sync needs a read-scope token; `keys list`, `loc pull` and `loc tags
+# list` need read, the other key commands need the manage scope.
+#
+# Token resolution, most specific wins: the brand's token variable, then the
+# stored per-project token, then the stored default token. `loc login
+# --project` stores per project; a bare `loc login` stores the default.
+#
+# The stored token authenticates loc projects only, which is why login sits
+# under `loc`. Bare `login`/`logout` stay as aliases.
+#
+# Environment (countrymanager | anylocale):
+#   CM_LOC_TOKEN  | ANYLOCALE_TOKEN   (optional) API token, overrides any stored one
+#   CM_LOC_URL    | ANYLOCALE_URL     (optional) API host, default the brand's own
+#   CM_LOC_CONFIG | ANYLOCALE_CONFIG  (optional) token store, default ~/.<brand>
+#
+# Exit codes: 0 success, 1 usage/auth error, 2 a request or download failed.
+
+set -eu
+
+# Bump on every change to this file, and cut a matching tap release - the two
+# install channels can otherwise drift silently: `install.sh` always fetches
+# whatever is live, while the Homebrew formula pins one frozen asset. With no
+# version there is no way to tell which copy a machine has.
+VERSION="1.8.0"
+
+# `[!A-Za-z0-9._-]` is collation-dependent: under a UTF-8 locale bash reads
+# `Ü` as inside `A-Z`, so every check_* below would pass text it is meant to
+# refuse. Byte semantics make them mean what they say.
+LC_ALL=C
+export LC_ALL
+
+# Every brand-dependent name, resolved once. Nothing below may spell a product
+# name, a host, an env variable or the config path directly.
+TOOL_NAME=$(basename "$0")
+if [ "${ANYLOCALE_CLI:-}" = "1" ] ||
+  [ "$TOOL_NAME" = "anylocale" ] ||
+  [ "$TOOL_NAME" = "anylocale.sh" ]; then
+  BRAND_NAME="anylocale"
+  BRAND_ARTICLE="an"
+  BASE_URL_DEFAULT="https://anylocale.com"
+  TOKEN_ENV="ANYLOCALE_TOKEN"
+  URL_ENV="ANYLOCALE_URL"
+  CONFIG_ENV="ANYLOCALE_CONFIG"
+  CONFIG_DEFAULT="$HOME/.anylocale"
+  # This product is localization alone, so the namespace is empty, which is
+  # also what makes its commands reachable straight from the top level.
+  NS_PREFIX=""
+  # Invocation shown in usage and error text. The brand name rather than `$0`,
+  # because the install channels all put it on the PATH under exactly this name.
+  SELF="anylocale"
+else
+  BRAND_NAME="countrymanager"
+  BRAND_ARTICLE="a"
+  BASE_URL_DEFAULT="https://countrymanager.app"
+  TOKEN_ENV="CM_LOC_TOKEN"
+  URL_ENV="CM_LOC_URL"
+  CONFIG_ENV="CM_LOC_CONFIG"
+  CONFIG_DEFAULT="$HOME/.countrymanager"
+  NS_PREFIX="loc "
+  SELF="$0"
+fi
+
+# Value of the variable NAMED $1, empty when unset. The brand block above holds
+# the names, so every read of a brand env variable goes through here.
+env_value() {
+  eval "printf '%s' \"\${$1:-}\""
+}
+
+USER_AGENT="$BRAND_NAME/$VERSION"
+# A response body is server-controlled. Anything PRINTED goes through this
+# first, so an escape sequence cannot repaint the reader's terminal; the file
+# `loc pull --out` writes is passed through untouched.
+printable() {
+  tr -d '\000-\010\013\014\016-\037\177'
+}
+# A hostile or broken server must not be able to fill the disk.
+MAX_BYTES=67108864
+BASE_URL=$(env_value "$URL_ENV")
+[ -n "$BASE_URL" ] || BASE_URL="$BASE_URL_DEFAULT"
+PROJECT=""
+OUT_DIR=""
+
+CONFIG_FILE=$(env_value "$CONFIG_ENV")
+[ -n "$CONFIG_FILE" ] || CONFIG_FILE="$CONFIG_DEFAULT"
+
+# The store is `key=value` lines read back into an Authorization header, so
+# only the token charset may pass - a tampered line must be dropped, not sent.
+valid_token() {
+  case "$1" in
+    cm_live_*) case "${1#cm_live_}" in ""|*[!A-Za-z0-9]*) return 1 ;; *) return 0 ;; esac ;;
+    *) return 1 ;;
+  esac
+}
+
+stored_token() {
+  # $1 config key (token | token.<slug>). Last entry wins, like re-login does.
+  [ -f "$CONFIG_FILE" ] || return 1
+  _key_re=$(printf '%s' "$1" | sed 's/\./\\./g')
+  _value=$(grep "^$_key_re=" "$CONFIG_FILE" | tail -n 1) || return 1
+  _value="${_value#*=}"
+  valid_token "$_value" || return 1
+  printf '%s' "$_value"
+}
+
+# Sets TOKEN from env or the store. $1 = project slug (may be empty).
+resolve_token() {
+  _env_token=$(env_value "$TOKEN_ENV")
+  if [ -n "$_env_token" ]; then TOKEN="$_env_token"; return 0; fi
+  if [ -n "$1" ] && TOKEN=$(stored_token "token.$1"); then return 0; fi
+  TOKEN=$(stored_token "token") && return 0
+  return 1
+}
+
+config_write() {
+  # Replace the $1 entry with $2 (empty $2 = remove). 0600 from the first byte.
+  _key_re=$(printf '%s' "$1" | sed 's/\./\\./g')
+  umask 077
+  _tmp="$CONFIG_FILE.tmp.$$"
+  {
+    [ -f "$CONFIG_FILE" ] && grep -v "^$_key_re=" "$CONFIG_FILE" || true
+    [ -n "$2" ] && printf '%s=%s\n' "$1" "$2"
+  } > "$_tmp"
+  mv "$_tmp" "$CONFIG_FILE"
+  chmod 600 "$CONFIG_FILE"
+}
+
+run_login() {
+  PROJECT=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --project) [ $# -ge 2 ] || usage; PROJECT="$2"; shift 2 ;;
+      *) echo "Unknown argument: $1" >&2; usage ;;
+    esac
+  done
+  [ -z "$PROJECT" ] || check_slug "$PROJECT"
+
+  # Hidden input where there is a terminal; piped stdin still works for
+  # scripted setups. The token itself is never echoed back.
+  if [ -t 0 ]; then
+    printf "Paste your API token (input hidden): "
+    stty -echo 2>/dev/null || true
+    read -r _token
+    stty echo 2>/dev/null || true
+    printf '\n'
+  else
+    read -r _token
+  fi
+
+  valid_token "$_token" || {
+    echo "That is not $BRAND_ARTICLE $BRAND_NAME API token (expected cm_live_...)" >&2
+    exit 1
+  }
+
+  _key="token"; [ -n "$PROJECT" ] && _key="token.$PROJECT"
+  config_write "$_key" "$_token"
+  _tail=$(printf '%s' "$_token" | awk '{ print substr($0, length($0) - 3) }')
+  if [ -n "$PROJECT" ]; then
+    echo "Stored token ...$_tail for project '$PROJECT' in $CONFIG_FILE"
+  else
+    echo "Stored default token ...$_tail in $CONFIG_FILE"
+  fi
+  exit 0
+}
+
+run_logout() {
+  PROJECT=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --project) [ $# -ge 2 ] || usage; PROJECT="$2"; shift 2 ;;
+      *) echo "Unknown argument: $1" >&2; usage ;;
+    esac
+  done
+  [ -z "$PROJECT" ] || check_slug "$PROJECT"
+
+  _key="token"; [ -n "$PROJECT" ] && _key="token.$PROJECT"
+  if [ ! -f "$CONFIG_FILE" ] || ! grep -q "^$(printf '%s' "$_key" | sed 's/\./\\./g')=" "$CONFIG_FILE"; then
+    echo "No stored token for '$_key'" >&2
+    exit 1
+  fi
+  config_write "$_key" ""
+  echo "Removed '$_key' from $CONFIG_FILE"
+  exit 0
+}
+
+require_token() {
+  # $1 needed scope (for the message), $2 project slug (may be empty).
+  resolve_token "${2:-}" && return 0
+  echo "No API token found.
+
+Create an API token ($1 scope) in your localization project's
+Settings -> Integrations screen, then either log in once:
+
+  $SELF ${NS_PREFIX}login${2:+ --project $2}
+
+or export it for this shell:
+
+  export $TOKEN_ENV=cm_live_..." >&2
+  exit 1
+}
+
+check_slug() {
+  case "$1" in
+    ""|*[!A-Za-z0-9_-]*)
+      echo "Invalid --project '$1': expected a project slug" >&2
+      exit 1 ;;
+  esac
+}
+
+check_locale() {
+  case "$1" in
+    ""|*[!A-Za-z0-9_-]*)
+      echo "Invalid --locale '$1': expected a locale code like en or pt-BR" >&2
+      exit 1 ;;
+  esac
+}
+
+# Rides in a query string, and the script carries no URL encoder.
+check_tag_name() {
+  case "$1" in
+    ""|*[!A-Za-z0-9._-]*)
+      echo "Invalid --tag '$1': letters, numbers, dots, underscores and hyphens" >&2
+      exit 1 ;;
+  esac
+}
+
+check_table_name() {
+  case "$1" in
+    ""|.*|*[!A-Za-z0-9._-]*)
+      echo "Invalid --file '$1': letters, numbers, dots, underscores and hyphens" >&2
+      exit 1 ;;
+  esac
+}
+
+check_format() {
+  case "$1" in
+    xcstrings|android-xml|json|next-intl|csv|strings|stringsdict) ;;
+    *)
+      echo "Invalid --format '$1': expected one of xcstrings, android-xml, json, next-intl, csv, strings, stringsdict" >&2
+      exit 1 ;;
+  esac
+}
+
+# Folds to the capitalized spelling the editor stores, and refuses anything
+# else: a typo must not quietly ship the other platform's strings.
+platform_param() {
+  case "$(printf %s "$1" | tr 'A-Z' 'a-z')" in
+    ios) echo "&platform=iOS" ;;
+    android) echo "&platform=Android" ;;
+    api) echo "&platform=API" ;;
+    *)
+      echo "Invalid --platform '$1': expected ios, android or api" >&2
+      exit 1 ;;
+  esac
+}
+
+check_key_name() {
+  case "$1" in
+    ""|.*|*[!A-Za-z0-9._-]*)
+      echo "Invalid --name '$1': letters, numbers, dots, underscores and hyphens" >&2
+      exit 1 ;;
+  esac
+}
+
+# JSON string escaping in POSIX awk: backslash and quote, plus the control
+# characters a shell argument can realistically carry. awk reads per line, so
+# embedded newlines become \n by joining records.
+# JSON-escapes $1. A sentinel byte is appended so a trailing newline survives
+# (awk treats it as a record terminator and would drop it), and every character
+# below 0x20 is escaped or the body is not valid JSON.
+json_escape() {
+  printf '%sX' "$1" | awk '
+    BEGIN {
+      RS = "\n"; ORS = ""; first = 1; res = ""
+      for (i = 1; i < 32; i++) ctrl[sprintf("%c", i)] = i
+      ctrl[sprintf("%c", 127)] = 127
+    }
+    {
+      if (!first) res = res "\\n"
+      first = 0
+      line = $0
+      gsub(/\\/, "\\\\", line)
+      gsub(/"/, "\\\"", line)
+      n = length(line)
+      for (i = 1; i <= n; i++) {
+        c = substr(line, i, 1)
+        if (c == "\t") res = res "\\t"
+        else if (c == "\r") res = res "\\r"
+        else if (c in ctrl) res = res sprintf("\\u%04x", ctrl[c])
+        else res = res c
+      }
+    }
+    END { printf "%s", substr(res, 1, length(res) - 1) }
+  '
+}
+
+# One API call; prints the response body and returns non-zero on HTTP >= 400,
+# so the server's error message reaches the user instead of a bare curl fail.
+api() {
+  _method="$1"; _url="$2"; _body="${3:-}"
+  if [ -n "$_body" ]; then
+    _resp=$(curl -sS -A "$USER_AGENT" -X "$_method" -H "$AUTH" \
+      -H "content-type: application/json" \
+      --data "$_body" -w '\n%{http_code}' "$_url") || return 2
+  else
+    _resp=$(curl -sS -A "$USER_AGENT" -X "$_method" -H "$AUTH" \
+      -w '\n%{http_code}' "$_url") || return 2
+  fi
+  _code=$(printf '%s' "$_resp" | tail -n 1)
+  _out=$(printf '%s\n' "$_resp" | sed '$d')
+  printf '%s\n' "$_out" | printable
+  [ "$_code" -lt 400 ]
+}
+
+keys_usage() {
+  echo "Usage: $TOKEN_ENV=... $SELF keys <list|create|update|delete> --project <slug> [--name <key>]" >&2
+  echo "Options: --description <text> --table <name> --plural --max-length <n> --tags <a,b> --yes" >&2
+  echo "         --add-tag <name> / --remove-tag <name> (update only; repeatable)" >&2
+  echo "         --platform <ios|android|api> (list only)" >&2
+  echo "         --value <locale>=<text> (create only; repeatable)" >&2
+  exit 1
+}
+
+pull_usage() {
+  echo "Usage: $SELF ${NS_PREFIX}pull --project <slug> --locale <code> --format <fmt> [options]" >&2
+  echo "Formats: xcstrings android-xml json next-intl csv strings stringsdict" >&2
+  echo "Options: --tag <name> --platform <ios|android|api> --no-comments --file <table> --out <path>" >&2
+  echo "         writes to stdout unless --out is given" >&2
+  exit 1
+}
+
+run_pull() {
+  LOCALE=""; FORMAT=""; OUT=""; NO_COMMENTS=0
+  PLATFORM_PARAM=""; TAG_PARAM=""; FILE_PARAM=""; COMMENTS_PARAM=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --project) [ $# -ge 2 ] || pull_usage; PROJECT="$2"; shift 2 ;;
+      --locale) [ $# -ge 2 ] || pull_usage; LOCALE="$2"; shift 2 ;;
+      --format) [ $# -ge 2 ] || pull_usage; FORMAT="$2"; shift 2 ;;
+      --out)
+        [ $# -ge 2 ] || pull_usage
+        # An unset CI variable must not silently mean "stdout".
+        [ -n "$2" ] || { echo "--out was given an empty path" >&2; exit 1; }
+        OUT="$2"; shift 2 ;;
+      --no-comments) NO_COMMENTS=1; shift ;;
+      --tag)
+        [ $# -ge 2 ] || pull_usage
+        check_tag_name "$2"
+        TAG_PARAM="&tag=$2"
+        shift 2 ;;
+      --file)
+        [ $# -ge 2 ] || pull_usage
+        check_table_name "$2"
+        FILE_PARAM="&file=$2"
+        shift 2 ;;
+      --platform)
+        [ $# -ge 2 ] || pull_usage
+        PLATFORM_PARAM="$(platform_param "$2")" || exit 1
+        shift 2 ;;
+      *) echo "Unknown argument: $1" >&2; pull_usage ;;
+    esac
+  done
+
+  [ -n "$PROJECT" ] || pull_usage
+  [ -n "$LOCALE" ] || pull_usage
+  [ -n "$FORMAT" ] || pull_usage
+  check_slug "$PROJECT"
+  check_locale "$LOCALE"
+  check_format "$FORMAT"
+  [ "$NO_COMMENTS" -eq 1 ] && COMMENTS_PARAM="&comments=0"
+
+  require_token "read" "$PROJECT"
+  AUTH="Authorization: Bearer $TOKEN"
+
+  _url="$BASE_URL/api/loc/pull?project=$PROJECT&locale=$LOCALE&format=$FORMAT"
+  _url="$_url$COMMENTS_PARAM$PLATFORM_PARAM$TAG_PARAM$FILE_PARAM"
+
+  if [ -n "$OUT" ]; then
+    # A directory would take the download INSIDE it under the temp name and
+    # still report success.
+    [ -d "$OUT" ] && { echo "--out '$OUT' is a directory" >&2; exit 1; }
+    case "$OUT" in
+      */) echo "--out '$OUT' names a directory, not a file" >&2; exit 1 ;;
+    esac
+    _dir=$(dirname -- "$OUT")
+    [ "$_dir" = "." ] || mkdir -p -- "$_dir" || exit 2
+    # Beside the target, like `sync`: same filesystem, so the rename is atomic
+    # and no shared /tmp is involved.
+    _tmp="$OUT.part"
+    # Checked like the shared-directory temp below: a planted symlink here is
+    # followed by `curl -o`, and `mv` then renames the LINK onto the target.
+    { [ -e "$_tmp" ] || [ -L "$_tmp" ]; } &&
+      { echo "Temporary file $_tmp already exists" >&2; exit 1; }
+    # The caller's own umask, so the target lands with the permissions `sync`'s
+    # files get; only the shared-directory temp below needs 077.
+    _mask=$(umask)
+  else
+    _tmp="${TMPDIR:-/tmp}/cm-pull.$$"
+    # `-L` as well as `-e`: a DANGLING symlink fails `-e`, and `curl -o`
+    # follows it, planting the body at the link's target.
+    { [ -e "$_tmp" ] || [ -L "$_tmp" ]; } &&
+      { echo "Temporary file $_tmp already exists" >&2; exit 1; }
+    _mask=077
+  fi
+  trap 'rm -f -- "$_tmp"' EXIT
+  trap 'rm -f -- "$_tmp"; exit 130' INT
+  trap 'rm -f -- "$_tmp"; exit 143' TERM
+
+  # NOT `curl -f`: that discards the response body, and the body is where the
+  # server says WHICH key the format cannot express, or which tags exist. The
+  # status is read separately so a refusal can be reported with its reason.
+  _code=$(umask "$_mask"; curl -sS -A "$USER_AGENT" -H "$AUTH" -o "$_tmp" \
+    --max-filesize "$MAX_BYTES" -w '%{http_code}' "$_url") || {
+    _curl=$?
+    # 23 is curl's "failure writing output": a full disk or an unwritable
+    # directory, which naming the network for would send the user hunting in
+    # the wrong place.
+    if [ "$_curl" -eq 23 ]; then
+      echo "Could not write $_tmp (check the path, permissions and free space)" >&2
+    else
+      echo "Request failed (check $URL_ENV / network)" >&2
+    fi
+    exit 2
+  }
+  # Only 2xx is a body. A redirect - an http:// base against an https host, or
+  # a proxy login page - would otherwise write its empty body over the target.
+  case "$_code" in
+    2*) ;;
+    *)
+      echo "Pull failed (HTTP $_code):" >&2
+      printable < "$_tmp" >&2
+      echo >&2
+      exit 2 ;;
+  esac
+
+  if [ -n "$OUT" ]; then
+    mv -- "$_tmp" "$OUT" || exit 2
+    echo "Wrote $OUT" >&2
+  else
+    cat -- "$_tmp"
+  fi
+}
+
+tags_usage() {
+  echo "Usage: $SELF ${NS_PREFIX}tags list --project <slug>" >&2
+  exit 1
+}
+
+run_tags() {
+  CMD="${1:-}"; [ $# -ge 1 ] && shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --project) [ $# -ge 2 ] || tags_usage; PROJECT="$2"; shift 2 ;;
+      *) echo "Unknown argument: $1" >&2; tags_usage ;;
+    esac
+  done
+
+  [ "$CMD" = "list" ] || tags_usage
+  [ -n "$PROJECT" ] || tags_usage
+  check_slug "$PROJECT"
+  require_token "read" "$PROJECT"
+  AUTH="Authorization: Bearer $TOKEN"
+
+  api GET "$BASE_URL/api/loc/keys?project=$PROJECT&plain=tags" || exit 2
+}
+
+values_usage() {
+  echo "Usage: $SELF ${NS_PREFIX}values <get|set> --project <slug> --name <key> [--value <locale>=<text>]..." >&2
+  echo "       plural keys take every CLDR category of the locale: --value de.one=... --value de.other=..." >&2
+  exit 1
+}
+
+# Assigns $2 to the variable named $1 without the shell re-reading the value.
+# Single quotes are literal, so JSON-escaped text carrying backslashes or double
+# quotes survives; an embedded single quote is closed, escaped and reopened.
+set_var() {
+  _q=$(printf '%s' "$2" | sed "s/'/'\\\\''/g")
+  eval "$1='$_q'"
+}
+
+# Reads the variable named $1 into REPLY_VALUE.
+get_var() {
+  eval "REPLY_VALUE=\$$1"
+}
+
+# Encodes a locale code into a shell variable suffix. `-` and `_` must map to
+# DIFFERENT sequences: a locale is allowed to spell a region either way
+# (pt-BR, pt_BR), and folding both onto `_` made the two share one slot, so one
+# value overwrote the other. Underscore is encoded first, or the escape
+# introduced for `-` would itself be re-encoded.
+value_slot() {
+  printf '%s' "$1" | sed 's/_/_5F/g; s/-/_2D/g'
+}
+
+# Appends one --value argument to the pending JSON. A bare locale writes a
+# string, `locale.category` collects into that locale's object. Values are
+# stored already JSON-escaped: any word-splitting round trip would lose the
+# leading, trailing and repeated spaces a translation is allowed to contain.
+collect_value() {
+  _pair="$1"
+  case "$_pair" in *=*) ;; *)
+    echo "Invalid --value '$_pair': expected <locale>=<text> or <locale>.<category>=<text>" >&2
+    exit 1 ;;
+  esac
+  _lhs="${_pair%%=*}"
+  _text="${_pair#*=}"
+  case "$_lhs" in
+    *.*)
+      _loc="${_lhs%%.*}"; _cat="${_lhs#*.}"
+      [ -n "$_cat" ] || {
+        echo "Invalid --value '$_pair': missing plural category after '$_loc.'" >&2
+        exit 1
+      }
+      ;;
+    *) _loc="$_lhs"; _cat="" ;;
+  esac
+  [ -n "$_loc" ] || { echo "Invalid --value '$_pair': missing locale" >&2; exit 1; }
+  case "$_loc" in
+    *[!A-Za-z0-9_-]*) echo "Invalid locale '$_loc' in --value" >&2; exit 1 ;;
+  esac
+
+  if [ -n "$_cat" ]; then
+    case "$_cat" in
+      zero|one|two|few|many|other) ;;
+      *) echo "Invalid plural category '$_cat' in --value (zero one two few many other)" >&2; exit 1 ;;
+    esac
+    case " $VALUE_FLAT_LOCALES " in *" $_loc "*)
+      echo "Locale '$_loc' was given both a plain value and plural categories" >&2; exit 1 ;;
+    esac
+    case " $VALUE_SEEN " in *" $_loc.$_cat "*)
+      echo "Duplicate --value for '$_loc.$_cat'" >&2; exit 1 ;;
+    esac
+    VALUE_SEEN="$VALUE_SEEN $_loc.$_cat"
+    _slot="VALUE_FORMS_$(value_slot "$_loc")"
+    case " $VALUE_PLURAL_LOCALES " in
+      *" $_loc "*) ;;
+      *) VALUE_PLURAL_LOCALES="$VALUE_PLURAL_LOCALES $_loc"; set_var "$_slot" "" ;;
+    esac
+    get_var "$_slot"
+    set_var "$_slot" "$REPLY_VALUE,\"$_cat\":\"$(json_escape "$_text")\""
+  else
+    case " $VALUE_PLURAL_LOCALES " in *" $_loc "*)
+      echo "Locale '$_loc' was given both a plain value and plural categories" >&2; exit 1 ;;
+    esac
+    case " $VALUE_SEEN " in *" $_loc "*)
+      echo "Duplicate --value for locale '$_loc'" >&2; exit 1 ;;
+    esac
+    VALUE_SEEN="$VALUE_SEEN $_loc"
+    VALUE_FLAT_LOCALES="$VALUE_FLAT_LOCALES $_loc"
+    set_var "VALUE_FLAT_$(value_slot "$_loc")" "$(json_escape "$_text")"
+  fi
+}
+
+# Builds the `values` object from what collect_value gathered, into VALUES_JSON.
+build_values_json() {
+  VALUES_JSON=""
+  for _loc in $VALUE_FLAT_LOCALES; do
+    get_var "VALUE_FLAT_$(value_slot "$_loc")"
+    VALUES_JSON="$VALUES_JSON,\"$_loc\":\"$REPLY_VALUE\""
+  done
+  for _loc in $VALUE_PLURAL_LOCALES; do
+    get_var "VALUE_FORMS_$(value_slot "$_loc")"
+    VALUES_JSON="$VALUES_JSON,\"$_loc\":{${REPLY_VALUE#,}}"
+  done
+  VALUES_JSON="{${VALUES_JSON#,}}"
+}
+
+run_values() {
+  CMD="${1:-}"; [ $# -ge 1 ] && shift
+  NAME=""
+  VALUE_FLAT_LOCALES=""; VALUE_PLURAL_LOCALES=""; VALUE_SEEN=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --project) [ $# -ge 2 ] || values_usage; PROJECT="$2"; shift 2 ;;
+      --name) [ $# -ge 2 ] || values_usage; NAME="$2"; shift 2 ;;
+      --value) [ $# -ge 2 ] || values_usage; collect_value "$2"; shift 2 ;;
+      *) echo "Unknown argument: $1" >&2; values_usage ;;
+    esac
+  done
+
+  [ -n "$PROJECT" ] || values_usage
+  [ -n "$NAME" ] || values_usage
+  check_slug "$PROJECT"
+  check_key_name "$NAME"
+
+  if [ "$CMD" = "get" ] && [ -n "$VALUE_FLAT_LOCALES$VALUE_PLURAL_LOCALES" ]; then
+    echo "--value applies to 'values set', not 'values get'" >&2
+    exit 1
+  fi
+
+  case "$CMD" in
+    get) require_token "read" "$PROJECT" ;;
+    set) require_token "push" "$PROJECT" ;;
+    *) values_usage ;;
+  esac
+  AUTH="Authorization: Bearer $TOKEN"
+
+  case "$CMD" in
+    get)
+      api GET "$BASE_URL/api/loc/keys/$NAME/translations?project=$PROJECT&plain=1" || exit 2
+      ;;
+    set)
+      [ -n "$VALUE_FLAT_LOCALES$VALUE_PLURAL_LOCALES" ] || {
+        echo "Pass at least one --value <locale>=<text>" >&2
+        exit 1
+      }
+      build_values_json
+      api PUT "$BASE_URL/api/loc/keys/$NAME/translations?project=$PROJECT" \
+        "{\"values\":$VALUES_JSON}" || exit 2
+      ;;
+  esac
+  exit 0
+}
+
+run_keys() {
+  CMD="${1:-}"; [ $# -ge 1 ] && shift
+  NAME=""; DESCRIPTION=""; TABLE=""; PLURAL=0; MAX_LENGTH=""; TAGS=""; YES=0
+  ADD_TAGS=""; REMOVE_TAGS=""
+  PLATFORM_PARAM=""
+  VALUE_FLAT_LOCALES=""; VALUE_PLURAL_LOCALES=""; VALUE_SEEN=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --project) [ $# -ge 2 ] || keys_usage; PROJECT="$2"; shift 2 ;;
+      --name) [ $# -ge 2 ] || keys_usage; NAME="$2"; shift 2 ;;
+      --description) [ $# -ge 2 ] || keys_usage; DESCRIPTION="$2"; shift 2 ;;
+      --table) [ $# -ge 2 ] || keys_usage; TABLE="$2"; shift 2 ;;
+      --plural) PLURAL=1; shift ;;
+      --max-length) [ $# -ge 2 ] || keys_usage; MAX_LENGTH="$2"; shift 2 ;;
+      --tags) [ $# -ge 2 ] || keys_usage; TAGS="$2"; shift 2 ;;
+      --add-tag)
+        [ $# -ge 2 ] || keys_usage
+        [ -n "$2" ] || { echo "--add-tag was given an empty tag" >&2; exit 1; }
+        ADD_TAGS="$ADD_TAGS,\"$(json_escape "$2")\""
+        shift 2 ;;
+      --remove-tag)
+        [ $# -ge 2 ] || keys_usage
+        [ -n "$2" ] || { echo "--remove-tag was given an empty tag" >&2; exit 1; }
+        REMOVE_TAGS="$REMOVE_TAGS,\"$(json_escape "$2")\""
+        shift 2 ;;
+      --platform)
+        [ $# -ge 2 ] || keys_usage
+        if [ "$CMD" != "list" ]; then
+          echo "--platform applies to 'keys list' only" >&2
+          exit 1
+        fi
+        PLATFORM_PARAM="$(platform_param "$2")" || exit 1
+        shift 2 ;;
+      --yes) YES=1; shift ;;
+      --value) [ $# -ge 2 ] || keys_usage; collect_value "$2"; shift 2 ;;
+      *) echo "Unknown argument: $1" >&2; keys_usage ;;
+    esac
+  done
+
+  [ -n "$PROJECT" ] || keys_usage
+  check_slug "$PROJECT"
+
+  if [ -n "$ADD_TAGS$REMOVE_TAGS" ]; then
+    [ "$CMD" = "update" ] || {
+      echo "--add-tag and --remove-tag apply to 'keys update' only" >&2; exit 1; }
+    [ -z "$TAGS" ] || {
+      echo "--tags replaces the whole set, so it cannot be combined with --add-tag or --remove-tag" >&2
+      exit 1; }
+  fi
+
+  if [ -n "$VALUE_FLAT_LOCALES$VALUE_PLURAL_LOCALES" ] && [ "$CMD" != "create" ]; then
+    echo "--value applies to 'keys create' only: use '$SELF ${NS_PREFIX}values set'" >&2
+    exit 1
+  fi
+
+  case "$CMD" in
+    list) require_token "read" "$PROJECT" ;;
+    create|update|delete) require_token "manage" "$PROJECT" ;;
+    *) keys_usage ;;
+  esac
+  AUTH="Authorization: Bearer $TOKEN"
+
+  case "$MAX_LENGTH" in *[!0-9]*)
+    echo "Invalid --max-length '$MAX_LENGTH': expected a number" >&2; exit 1 ;;
+  esac
+
+  case "$CMD" in
+    list)
+      api GET "$BASE_URL/api/loc/keys?project=$PROJECT&plain=1$PLATFORM_PARAM" || exit 2
+      ;;
+    create|update)
+      [ -n "$NAME" ] || keys_usage
+      check_key_name "$NAME"
+      body="{\"keyName\":\"$(json_escape "$NAME")\""
+      [ -n "$DESCRIPTION" ] && body="$body,\"description\":\"$(json_escape "$DESCRIPTION")\""
+      [ -n "$MAX_LENGTH" ] && body="$body,\"maxLength\":$MAX_LENGTH"
+      [ "$PLURAL" -eq 1 ] && body="$body,\"isPlural\":true"
+      if [ -n "$TAGS" ]; then
+        tag_json=""
+        OLD_IFS="$IFS"; IFS=,
+        for tag in $TAGS; do
+          [ -n "$tag" ] || continue
+          tag_json="$tag_json,\"$(json_escape "$tag")\""
+        done
+        IFS="$OLD_IFS"
+        body="$body,\"tags\":[${tag_json#,}]"
+      fi
+      [ -n "$ADD_TAGS" ] && body="$body,\"addTags\":[${ADD_TAGS#,}]"
+      [ -n "$REMOVE_TAGS" ] && body="$body,\"removeTags\":[${REMOVE_TAGS#,}]"
+      if [ "$CMD" = "create" ]; then
+        [ -n "$TABLE" ] && body="$body,\"fileName\":\"$(json_escape "$TABLE")\""
+        body="$body}"
+        api POST "$BASE_URL/api/loc/keys?project=$PROJECT" "$body" || exit 2
+        if [ -n "$VALUE_FLAT_LOCALES$VALUE_PLURAL_LOCALES" ]; then
+          require_token "push" "$PROJECT"
+          AUTH="Authorization: Bearer $TOKEN"
+          build_values_json
+          api PUT "$BASE_URL/api/loc/keys/$NAME/translations?project=$PROJECT" \
+            "{\"values\":$VALUES_JSON}" || {
+            echo "Key '$NAME' was created but its values were not written (the write needs push scope)." >&2
+            exit 2
+          }
+        fi
+      else
+        [ -n "$TABLE" ] && {
+          echo "--table is create-only: moving a key between tables is not a metadata edit" >&2
+          exit 1
+        }
+        body="$body}"
+        api PATCH "$BASE_URL/api/loc/keys/$NAME?project=$PROJECT" "$body" || exit 2
+      fi
+      ;;
+    delete)
+      [ -n "$NAME" ] || keys_usage
+      check_key_name "$NAME"
+      if [ "$YES" -ne 1 ]; then
+        [ -t 0 ] || {
+          echo "stdin is not a terminal; pass --yes to delete non-interactively" >&2
+          exit 1
+        }
+        printf "Delete key '%s' from project '%s'? This removes its translations in every locale. [y/N] " "$NAME" "$PROJECT"
+        read -r answer
+        case "$answer" in y|Y|yes|YES) ;; *) echo "Aborted." >&2; exit 1 ;; esac
+      fi
+      api DELETE "$BASE_URL/api/loc/keys/$NAME?project=$PROJECT" || exit 2
+      ;;
+  esac
+  exit 0
+}
+
+
+
+usage() {
+  echo "Usage: $SELF ${NS_PREFIX}login [--project <slug>]   |   $SELF ${NS_PREFIX}logout [--project <slug>]" >&2
+  echo "       $SELF ${NS_PREFIX}sync --project <slug> --out-dir <dir> [--no-comments] [--platform <ios|android|api>]" >&2
+  echo "       $SELF ${NS_PREFIX}pull --project <slug> --locale <code> --format <fmt> [--tag <name>] [--out <path>]" >&2
+  echo "       $SELF ${NS_PREFIX}keys <list|create|update|delete> --project <slug> [options]" >&2
+  echo "       $SELF ${NS_PREFIX}values <get|set> --project <slug> --name <key> [--value <locale>=<text>]..." >&2
+  echo "       $SELF ${NS_PREFIX}tags list --project <slug>" >&2
+  echo "       $SELF --version" >&2
+  exit 1
+}
+
+
+run_sync() {
+  NO_COMMENTS=0
+  # Validated where the flag is read, so an empty `--platform ""` - an unset CI
+  # variable - fails instead of passing for "no filter".
+  PLATFORM_PARAM=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --project) [ $# -ge 2 ] || usage; PROJECT="$2"; shift 2 ;;
+      --out-dir) [ $# -ge 2 ] || usage; OUT_DIR="$2"; shift 2 ;;
+      --platform)
+        [ $# -ge 2 ] || usage
+        PLATFORM_PARAM="$(platform_param "$2")" || exit 1
+        shift 2 ;;
+      --no-comments) NO_COMMENTS=1; shift ;;
+      --version) echo "$BRAND_NAME $VERSION"; exit 0 ;;
+      *) echo "Unknown argument: $1" >&2; usage ;;
+    esac
+  done
+
+  [ -n "$PROJECT" ] && [ -n "$OUT_DIR" ] || usage
+
+  # The slug is spliced into a query string; hold it to the charset a slug can
+  # actually contain so it cannot inject extra parameters.
+  case "$PROJECT" in
+    *[!A-Za-z0-9_-]*)
+      echo "Invalid --project '$PROJECT': expected a project slug" >&2
+      exit 1 ;;
+  esac
+
+  require_token "read" "$PROJECT"
+  COMMENTS_PARAM=""
+  [ "$NO_COMMENTS" -eq 1 ] && COMMENTS_PARAM="&comments=0"
+
+  AUTH="Authorization: Bearer $TOKEN"
+
+  # One authenticated GET; -f turns HTTP errors into a non-zero exit so a bad
+  # token or unknown project stops the run instead of writing an error body
+  # into a .strings file.
+  fetch() {
+    curl -fsS -A "$USER_AGENT" -H "$AUTH" "$1"
+  }
+
+  LISTING=$(fetch "$BASE_URL/api/loc/locales?project=$PROJECT&plain=1$PLATFORM_PARAM") || {
+    echo "Failed to list locales for '$PROJECT' (check $TOKEN_ENV / $URL_ENV)" >&2
+    exit 1
+  }
+
+  # Strip CR as a SEPARATE step, never as `fetch ... | tr` - a pipeline reports
+  # the LAST command's status, so piping here would discard curl's failure and
+  # swallow a bad token. A CR (from any intermediary that normalizes line
+  # endings) would otherwise ride along on each line's last field and fail the
+  # safe-name test below, rejecting the entire listing.
+  LISTING=$(printf '%s\n' "$LISTING" | tr -d '\r')
+
+  # Never trust the listing to be path-safe: every value is used as a FILENAME
+  # below, so anything with a slash, `..`, whitespace or other surprises is
+  # dropped rather than written. The server constrains these already - this is
+  # the client's own guarantee that it cannot be talked into writing outside
+  # --out-dir. The field COUNT is part of each rule: a name containing a space
+  # would otherwise pass as its own first word (`file Widget Intents` reading
+  # as the table `Widget`) and silently sync the wrong, empty file.
+  SAFE_NAME='/^[A-Za-z0-9_][A-Za-z0-9_.-]*$/'
+
+  LOCALES=$(printf '%s\n' "$LISTING" | awk "
+    \$1 == \"locale\" && \$2 ~ $SAFE_NAME &&
+    (NF == 2 || (NF == 3 && \$3 == \"source\")) { print \$2 }
+  ")
+  FILES=$(printf '%s\n' "$LISTING" | awk "
+    \$1 == \"file\" && \$2 ~ $SAFE_NAME && NF == 2 { print \$2 }
+  ")
+
+  [ -n "$LOCALES" ] || { echo "Project '$PROJECT' has no locales" >&2; exit 1; }
+  [ -n "$FILES" ] || { echo "Project '$PROJECT' has no string tables" >&2; exit 1; }
+
+  synced=0
+  line_break_files=0
+  failures=0
+  # The in-flight download, cleaned up if the run is interrupted so a killed
+  # sync never leaves a hidden half-file behind in the user's .lproj. Only one
+  # download is ever in flight (the loop is sequential), so one name suffices.
+  part=""
+  trap 'rm -f "${part:-}"' EXIT
+  # A cleanup-only INT/TERM handler returns control to the loop, so Ctrl-C would
+  # merely fail the current file and march on through every remaining one - one
+  # interrupt per file. Exit explicitly with the conventional 128+SIGINT.
+  trap 'rm -f "${part:-}"; exit 130' INT TERM
+
+  for locale in $LOCALES; do
+    lproj="$OUT_DIR/$locale.lproj"
+    mkdir -p -- "$lproj"
+
+    for table in $FILES; do
+      query="project=$PROJECT&locale=$locale&file=$table"
+
+      # Download to a temp file and move it into place only on success. A plain
+      # `> file` redirection truncates the target BEFORE curl runs, so a
+      # transient 5xx or a dropped connection would destroy the committed
+      # translations that were already there.
+      part="$lproj/.$table.strings.part"
+      if ! fetch "$BASE_URL/api/loc/pull?$query&format=strings$COMMENTS_PARAM$PLATFORM_PARAM" > "$part"; then
+        echo "Failed to pull $locale/$table.strings" >&2
+        rm -f "$part"
+        failures=$((failures + 1))
+        continue
+      fi
+      if ! mv "$part" "$lproj/$table.strings"; then
+        echo "Failed to write $locale/$table.strings" >&2
+        rm -f "$part"
+        failures=$((failures + 1))
+        continue
+      fi
+
+      # Same lint as the classic pull scripts: a \n escape right before the
+      # closing quote is a trailing line break, almost always a copy mistake.
+      # Mid-value \n is legitimate multi-line copy and stays silent.
+      if grep -q '\\n"' "$lproj/$table.strings"; then
+        line_break_files=$((line_break_files + 1))
+        echo "Warning: trailing line break in $lproj/$table.strings" >&2
+      fi
+
+      part="$lproj/.$table.stringsdict.part"
+      if ! fetch "$BASE_URL/api/loc/pull?$query&format=stringsdict$COMMENTS_PARAM$PLATFORM_PARAM" > "$part"; then
+        echo "Failed to pull $locale/$table.stringsdict" >&2
+        rm -f "$part"
+        failures=$((failures + 1))
+        continue
+      fi
+      # A plural-less table serializes to a bare plist skeleton - drop it rather
+      # than committing an empty file into the Xcode project. Decided on the
+      # DOWNLOAD, so a table that lost its plurals still clears the stale file
+      # while a skeleton never replaces a good one.
+      if grep -q '<key>' "$part"; then
+        if ! mv "$part" "$lproj/$table.stringsdict"; then
+          echo "Failed to write $locale/$table.stringsdict" >&2
+          rm -f "$part"
+          failures=$((failures + 1))
+          continue
+        fi
+      else
+        rm -f "$part" "$lproj/$table.stringsdict"
+      fi
+    done
+
+    synced=$((synced + 1))
+    echo "Synced $locale.lproj"
+  done
+
+  if [ "$line_break_files" -eq 0 ]; then
+    echo "Synced $synced locales into $OUT_DIR - no line breaks found"
+  else
+    echo "Synced $synced locales into $OUT_DIR - $line_break_files file(s) contain line breaks"
+  fi
+
+  [ "$failures" -eq 0 ] || { echo "$failures file(s) failed to download" >&2; exit 2; }
+}
+
+# The localization commands, whether they were reached through `loc` or, on a
+# brand that has no other namespace, straight from the top level.
+dispatch_loc() {
+  case "${1:-}" in
+    login) shift; run_login "$@" ;;
+    logout) shift; run_logout "$@" ;;
+    sync) shift; run_sync "$@" ;;
+    pull) shift; run_pull "$@" ;;
+    keys) shift; run_keys "$@" ;;
+    values) shift; run_values "$@" ;;
+    tags) shift; run_tags "$@" ;;
+    *) usage ;;
+  esac
+}
+
+if [ -z "$NS_PREFIX" ]; then
+  case "${1:-}" in
+    loc) shift; dispatch_loc "$@" ;;
+    login|logout|sync|pull|keys|values|tags) dispatch_loc "$@" ;;
+    *) run_sync "$@" ;;
+  esac
+else
+  case "${1:-}" in
+    loc) shift; dispatch_loc "$@" ;;
+    login|logout|keys) dispatch_loc "$@" ;;
+    reviews)
+      echo "The reviews commands are not available yet; loc is the first namespace." >&2
+      exit 1
+      ;;
+    *) run_sync "$@" ;;
+  esac
+fi
