@@ -8,10 +8,11 @@
 # countrymanager - so a symlink or a renamed copy is the whole of the second
 # CLI. `ANYLOCALE_CLI=1` forces it, which is what `sh pull-strings.sh` needs.
 #
-# countrymanager groups commands under one namespace per product area; `loc` is
-# localization, and further areas (reviews, ...) will claim their own as their
-# APIs land. anylocale is localization alone, so there `loc` is optional:
-# `anylocale sync` and `anylocale loc sync` are the same command.
+# countrymanager groups commands under one namespace per product area: `loc` is
+# localization, `reviews` (with `apps`, `insights` and `ratings`) is the App
+# Store review side. anylocale is localization alone, so there `loc` is
+# optional - `anylocale sync` and `anylocale loc sync` are the same command -
+# and the review commands do not exist.
 #
 # Usage (countrymanager spellings; drop the `loc` under anylocale):
 #   ./pull-strings.sh loc login  [--project <slug>]  # prompt for a token, store it
@@ -23,6 +24,23 @@
 #   ./pull-strings.sh loc keys delete --project <slug> --name <key> [--yes]
 #   ./pull-strings.sh loc pull  --project <slug> --locale <code> --format <fmt> [--tag <name>] [--out <path>]
 #   ./pull-strings.sh loc tags list --project <slug>
+#
+# Review commands (countrymanager only; every one prints the JSON the API sent):
+#   ./pull-strings.sh apps
+#   ./pull-strings.sh reviews login | logout                 # the org token
+#   ./pull-strings.sh reviews list [--app <id>] [--country <cc>] [--rating <1|1,2>] [--state <s>]
+#                                  [--since <date>] [--until <date>] [--limit <n>] [--cursor <c> | --all]
+#   ./pull-strings.sh reviews show    --id <id>
+#   ./pull-strings.sh reviews draft   --id <id> --text "..." | --file <path> | stdin
+#   ./pull-strings.sh reviews publish --id <id> [--text "..." | --file <path>] [--yes]
+#   ./pull-strings.sh insights list --app <id> [--since <date>]
+#   ./pull-strings.sh ratings --app <id>
+#
+# Review commands take the org-wide token (scopes reviews:read, reviews:reply,
+# reviews:publish): CM_LOC_TOKEN, then the token `reviews login` stored, then
+# the stored default. Output is the raw response body; it is pretty-printed
+# only when stdout is a terminal AND `jq` is on the PATH. `--all` follows
+# `nextCursor` and prints one document per page.
 #
 # `loc sync` downloads every locale and every string table of a localization
 # project as <code>.lproj/<Name>.strings (+ .stringsdict where plurals
@@ -57,7 +75,7 @@ set -eu
 # install channels can otherwise drift silently: `install.sh` always fetches
 # whatever is live, while the Homebrew formula pins one frozen asset. With no
 # version there is no way to tell which copy a machine has.
-VERSION="1.8.0"
+VERSION="1.9.0"
 
 # `[!A-Za-z0-9._-]` is collation-dependent: under a UTF-8 locale bash reads
 # `Ü` as inside `A-Z`, so every check_* below would pass text it is meant to
@@ -111,6 +129,26 @@ printable() {
 }
 # A hostile or broken server must not be able to fill the disk.
 MAX_BYTES=67108864
+# The largest page `reviews list --limit` may ask for; the server refuses more.
+MAX_LIST_LIMIT=100
+
+NL='
+'
+CR=$(printf '\r')
+# curl with the Authorization header. The token reaches curl as a `--config`
+# line on stdin, never in argv, where `ps` shows it to every user on the
+# machine. curl reads the quoted value with backslash escapes, and a line
+# break would start a second config line, so one is refused outright.
+curl_auth() {
+  case "$TOKEN" in
+    *"$NL"*|*"$CR"*)
+      echo "The API token must be a single line" >&2
+      return 2 ;;
+  esac
+  printf 'header = "Authorization: Bearer %s"\n' \
+    "$(printf '%s' "$TOKEN" | sed 's/\\/\\\\/g; s/"/\\"/g')" |
+    curl --config - "$@"
+}
 BASE_URL=$(env_value "$URL_ENV")
 [ -n "$BASE_URL" ] || BASE_URL="$BASE_URL_DEFAULT"
 PROJECT=""
@@ -160,6 +198,30 @@ config_write() {
   chmod 600 "$CONFIG_FILE"
 }
 
+# Reads one token from stdin into TOKEN_INPUT: hidden where there is a
+# terminal, plain for a piped scripted setup. Never echoed back, and refused
+# before it can be stored unless it has the token shape.
+read_token_input() {
+  if [ -t 0 ]; then
+    printf "Paste your API token (input hidden): "
+    stty -echo 2>/dev/null || true
+    read -r TOKEN_INPUT
+    stty echo 2>/dev/null || true
+    printf '\n'
+  else
+    read -r TOKEN_INPUT
+  fi
+
+  valid_token "$TOKEN_INPUT" || {
+    echo "That is not $BRAND_ARTICLE $BRAND_NAME API token (expected cm_live_...)" >&2
+    exit 1
+  }
+}
+
+token_tail() {
+  printf '%s' "$1" | awk '{ print substr($0, length($0) - 3) }'
+}
+
 run_login() {
   PROJECT=""
   while [ $# -gt 0 ]; do
@@ -169,27 +231,11 @@ run_login() {
     esac
   done
   [ -z "$PROJECT" ] || check_slug "$PROJECT"
-
-  # Hidden input where there is a terminal; piped stdin still works for
-  # scripted setups. The token itself is never echoed back.
-  if [ -t 0 ]; then
-    printf "Paste your API token (input hidden): "
-    stty -echo 2>/dev/null || true
-    read -r _token
-    stty echo 2>/dev/null || true
-    printf '\n'
-  else
-    read -r _token
-  fi
-
-  valid_token "$_token" || {
-    echo "That is not $BRAND_ARTICLE $BRAND_NAME API token (expected cm_live_...)" >&2
-    exit 1
-  }
+  read_token_input
 
   _key="token"; [ -n "$PROJECT" ] && _key="token.$PROJECT"
-  config_write "$_key" "$_token"
-  _tail=$(printf '%s' "$_token" | awk '{ print substr($0, length($0) - 3) }')
+  config_write "$_key" "$TOKEN_INPUT"
+  _tail=$(token_tail "$TOKEN_INPUT")
   if [ -n "$PROJECT" ]; then
     echo "Stored token ...$_tail for project '$PROJECT' in $CONFIG_FILE"
   else
@@ -334,11 +380,11 @@ json_escape() {
 api() {
   _method="$1"; _url="$2"; _body="${3:-}"
   if [ -n "$_body" ]; then
-    _resp=$(curl -sS -A "$USER_AGENT" -X "$_method" -H "$AUTH" \
+    _resp=$(curl_auth -sS -A "$USER_AGENT" -X "$_method" \
       -H "content-type: application/json" \
       --data "$_body" -w '\n%{http_code}' "$_url") || return 2
   else
-    _resp=$(curl -sS -A "$USER_AGENT" -X "$_method" -H "$AUTH" \
+    _resp=$(curl_auth -sS -A "$USER_AGENT" -X "$_method" \
       -w '\n%{http_code}' "$_url") || return 2
   fi
   _code=$(printf '%s' "$_resp" | tail -n 1)
@@ -405,7 +451,6 @@ run_pull() {
   [ "$NO_COMMENTS" -eq 1 ] && COMMENTS_PARAM="&comments=0"
 
   require_token "read" "$PROJECT"
-  AUTH="Authorization: Bearer $TOKEN"
 
   _url="$BASE_URL/api/loc/pull?project=$PROJECT&locale=$LOCALE&format=$FORMAT"
   _url="$_url$COMMENTS_PARAM$PLATFORM_PARAM$TAG_PARAM$FILE_PARAM"
@@ -444,7 +489,7 @@ run_pull() {
   # NOT `curl -f`: that discards the response body, and the body is where the
   # server says WHICH key the format cannot express, or which tags exist. The
   # status is read separately so a refusal can be reported with its reason.
-  _code=$(umask "$_mask"; curl -sS -A "$USER_AGENT" -H "$AUTH" -o "$_tmp" \
+  _code=$(umask "$_mask"; curl_auth -sS -A "$USER_AGENT" -o "$_tmp" \
     --max-filesize "$MAX_BYTES" -w '%{http_code}' "$_url") || {
     _curl=$?
     # 23 is curl's "failure writing output": a full disk or an unwritable
@@ -494,7 +539,6 @@ run_tags() {
   [ -n "$PROJECT" ] || tags_usage
   check_slug "$PROJECT"
   require_token "read" "$PROJECT"
-  AUTH="Authorization: Bearer $TOKEN"
 
   api GET "$BASE_URL/api/loc/keys?project=$PROJECT&plain=tags" || exit 2
 }
@@ -628,7 +672,6 @@ run_values() {
     set) require_token "push" "$PROJECT" ;;
     *) values_usage ;;
   esac
-  AUTH="Authorization: Bearer $TOKEN"
 
   case "$CMD" in
     get)
@@ -707,7 +750,6 @@ run_keys() {
     create|update|delete) require_token "manage" "$PROJECT" ;;
     *) keys_usage ;;
   esac
-  AUTH="Authorization: Bearer $TOKEN"
 
   case "$MAX_LENGTH" in *[!0-9]*)
     echo "Invalid --max-length '$MAX_LENGTH': expected a number" >&2; exit 1 ;;
@@ -742,7 +784,6 @@ run_keys() {
         api POST "$BASE_URL/api/loc/keys?project=$PROJECT" "$body" || exit 2
         if [ -n "$VALUE_FLAT_LOCALES$VALUE_PLURAL_LOCALES" ]; then
           require_token "push" "$PROJECT"
-          AUTH="Authorization: Bearer $TOKEN"
           build_values_json
           api PUT "$BASE_URL/api/loc/keys/$NAME/translations?project=$PROJECT" \
             "{\"values\":$VALUES_JSON}" || {
@@ -777,16 +818,503 @@ run_keys() {
   exit 0
 }
 
+# ---------------------------------------------------------------------------
+# Review commands: apps, reviews, insights, ratings. countrymanager only.
+# ---------------------------------------------------------------------------
 
+REVIEW_TOKEN_KEY="reviews.token"
+# `--all` follows nextCursor; a server that never runs out of pages must not
+# keep a script running forever.
+MAX_PAGES=500
+
+# Percent-encodes $1 for a query string: everything outside the unreserved
+# set, so `+`, `=`, `/` and spaces in a cursor or a timestamp arrive intact.
+# Same sentinel trick as json_escape, so a trailing newline survives awk.
+url_encode() {
+  printf '%sX' "$1" | awk '
+    BEGIN {
+      ORS = ""; first = 1; res = ""
+      for (i = 1; i < 256; i++) ord[sprintf("%c", i)] = i
+    }
+    {
+      if (!first) res = res "%0A"
+      first = 0
+      n = length($0)
+      for (i = 1; i <= n; i++) {
+        c = substr($0, i, 1)
+        if (c ~ /^[A-Za-z0-9._~-]$/) res = res c
+        else res = res sprintf("%%%02X", ord[c])
+      }
+    }
+    END { printf "%s", substr(res, 1, length(res) - 1) }
+  '
+}
+
+lowercase() {
+  printf '%s' "$1" | tr 'A-Z' 'a-z'
+}
+
+# Review and app ids ride in a URL path, so only the id charset may pass.
+check_id() {
+  case "$2" in
+    ""|*[!A-Za-z0-9_-]*)
+      echo "Invalid $1 '$2': expected an id" >&2
+      exit 1 ;;
+  esac
+}
+
+check_country() {
+  case "$1" in
+    [A-Za-z][A-Za-z]|[A-Za-z][A-Za-z][A-Za-z]) ;;
+    *)
+      echo "Invalid --country '$1': expected a store country code like jp" >&2
+      exit 1 ;;
+  esac
+}
+
+check_rating() {
+  case "$1" in
+    ""|*[!1-5,]*|,*|*,|*,,*)
+      echo "Invalid --rating '$1': expected 1-5, comma-separated for several" >&2
+      exit 1 ;;
+  esac
+}
+
+check_state() {
+  case "$1" in
+    ""|*[!a-z_]*)
+      echo "Invalid --state '$1': expected new, in_progress, replied or ignored" >&2
+      exit 1 ;;
+  esac
+}
+
+check_limit() {
+  case "$1" in
+    ""|*[!0-9]*|0*)
+      echo "Invalid --limit '$1': expected a number from 1 to 100" >&2
+      exit 1 ;;
+  esac
+  [ "$1" -le "$MAX_LIST_LIMIT" ] || {
+    echo "Invalid --limit '$1': expected a number from 1 to 100" >&2
+    exit 1
+  }
+}
+
+# $1 flag name, $2 value: a date, or a date with an ISO 8601 time.
+check_date() {
+  case "$2" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) return 0 ;;
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*)
+      case "${2#??????????T}" in
+        ""|*[!0-9:.Z+-]*) ;;
+        *) return 0 ;;
+      esac ;;
+  esac
+  echo "Invalid $1 '$2': expected YYYY-MM-DD or an ISO 8601 timestamp" >&2
+  exit 1
+}
+
+# Env, then the token `reviews login` stored, then the stored default.
+resolve_review_token() {
+  _env_token=$(env_value "$TOKEN_ENV")
+  if [ -n "$_env_token" ]; then TOKEN="$_env_token"; return 0; fi
+  TOKEN=$(stored_token "$REVIEW_TOKEN_KEY") && return 0
+  TOKEN=$(stored_token "token") && return 0
+  return 1
+}
+
+require_review_token() {
+  # $1 needed scope (for the message).
+  resolve_review_token && return 0
+  echo "No API token found.
+
+Create an organization API token with the $1 scope under
+Settings -> Integrations, then either log in once:
+
+  $SELF reviews login
+
+or export it for this shell:
+
+  export $TOKEN_ENV=cm_live_..." >&2
+  exit 1
+}
+
+run_reviews_login() {
+  [ $# -eq 0 ] || { echo "Unknown argument: $1" >&2; reviews_usage; }
+  read_token_input
+  config_write "$REVIEW_TOKEN_KEY" "$TOKEN_INPUT"
+  echo "Stored organization token ...$(token_tail "$TOKEN_INPUT") in $CONFIG_FILE"
+  exit 0
+}
+
+run_reviews_logout() {
+  [ $# -eq 0 ] || { echo "Unknown argument: $1" >&2; reviews_usage; }
+  if [ ! -f "$CONFIG_FILE" ] || ! grep -q "^reviews\.token=" "$CONFIG_FILE"; then
+    echo "No stored organization token" >&2
+    exit 1
+  fi
+  config_write "$REVIEW_TOKEN_KEY" ""
+  echo "Removed the organization token from $CONFIG_FILE"
+  exit 0
+}
+
+# One review API call. A 2xx body lands in REVIEW_BODY; anything else is
+# reported on stderr with the server's reason and returns 2, so a script
+# piping stdout into jq never parses an error as data.
+review_api() {
+  _method="$1"; _url="$2"; _body="${3:-}"
+  if [ -n "$_body" ]; then
+    _resp=$(curl_auth -sS -A "$USER_AGENT" -X "$_method" \
+      -H "content-type: application/json" --data "$_body" \
+      --max-filesize "$MAX_BYTES" -w '\n%{http_code}' "$_url") || {
+      echo "Request failed (check $URL_ENV / network)" >&2
+      return 2
+    }
+  else
+    _resp=$(curl_auth -sS -A "$USER_AGENT" -X "$_method" \
+      --max-filesize "$MAX_BYTES" -w '\n%{http_code}' "$_url") || {
+      echo "Request failed (check $URL_ENV / network)" >&2
+      return 2
+    }
+  fi
+  _code=$(printf '%s' "$_resp" | tail -n 1)
+  REVIEW_BODY=$(printf '%s\n' "$_resp" | sed '$d' | printable)
+  case "$_code" in
+    2*) return 0 ;;
+    *)
+      echo "Request failed (HTTP $_code): $REVIEW_BODY" >&2
+      return 2 ;;
+  esac
+}
+
+# Raw bytes for a pipe; pretty only for a person, and only when jq exists.
+print_json() {
+  if [ -t 1 ] && command -v jq >/dev/null 2>&1 &&
+    _pretty=$(printf '%s\n' "$1" | jq . 2>/dev/null); then
+    printf '%s\n' "$_pretty"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
+# The top-level nextCursor of a page, read without a JSON parser. The key is
+# accepted only right after `{` or `,`: inside a JSON string every quote is
+# escaped, so review text cannot spell an unescaped `"nextCursor"`. Whitespace
+# is dropped first so a pretty-printed body matches too; a cursor holding a
+# quote, a backslash or a space fails the match and simply ends the paging.
+next_cursor() {
+  printf '%s' "$1" | tr -d '\n\r\t ' |
+    sed -n 's/.*[{,]"nextCursor":"\([^"\\]*\)".*/\1/p'
+}
+
+reviews_usage_text() {
+  cat <<EOF
+Usage: $SELF reviews <list|show|draft|publish|login|logout> [options]
+
+  list     [--app <id>] [--country <cc>] [--rating <1|1,2>] [--state <state>]
+           [--since <date>] [--until <date>] [--limit <n>] [--cursor <c> | --all]
+                                                             needs reviews:read
+  show     --id <id>                                         needs reviews:read
+  draft    --id <id> --text "..." | --file <path> | stdin    needs reviews:reply
+  publish  --id <id> [--text "..." | --file <path>] [--yes]  needs reviews:publish
+           Sends the reply to the store, where it reaches real users. Asks
+           first on a terminal; --yes skips the question. Without text it
+           publishes the review's existing draft.
+  login    store the organization token ($TOKEN_ENV overrides it)
+  logout   remove it again
+
+States: new, in_progress, replied, ignored. Dates: YYYY-MM-DD or ISO 8601.
+Output is the JSON the API sent. --all follows nextCursor and prints one
+document per page; --file - reads the text from stdin.
+EOF
+}
+
+reviews_usage() {
+  reviews_usage_text >&2
+  exit 1
+}
+
+run_reviews_list() {
+  QUERY=""; CURSOR=""; ALL=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --help|-h) reviews_usage_text; exit 0 ;;
+      --app)
+        [ $# -ge 2 ] || reviews_usage
+        check_id "--app" "$2"
+        QUERY="$QUERY&app=$(url_encode "$2")"; shift 2 ;;
+      --country)
+        [ $# -ge 2 ] || reviews_usage
+        check_country "$2"
+        QUERY="$QUERY&country=$(lowercase "$2")"; shift 2 ;;
+      --rating)
+        [ $# -ge 2 ] || reviews_usage
+        check_rating "$2"
+        QUERY="$QUERY&rating=$(url_encode "$2")"; shift 2 ;;
+      --state)
+        [ $# -ge 2 ] || reviews_usage
+        check_state "$2"
+        QUERY="$QUERY&state=$(url_encode "$2")"; shift 2 ;;
+      --since|--until)
+        [ $# -ge 2 ] || reviews_usage
+        check_date "$1" "$2"
+        QUERY="$QUERY&${1#--}=$(url_encode "$2")"; shift 2 ;;
+      --limit)
+        [ $# -ge 2 ] || reviews_usage
+        check_limit "$2"
+        QUERY="$QUERY&limit=$2"; shift 2 ;;
+      --cursor)
+        [ $# -ge 2 ] || reviews_usage
+        [ -n "$2" ] || { echo "Invalid --cursor: it is empty" >&2; exit 1; }
+        CURSOR="$2"; shift 2 ;;
+      --all) ALL=1; shift ;;
+      *) echo "Unknown argument: $1" >&2; reviews_usage ;;
+    esac
+  done
+  if [ "$ALL" -eq 1 ] && [ -n "$CURSOR" ]; then
+    echo "--all starts from the first page, so it cannot be combined with --cursor" >&2
+    exit 1
+  fi
+
+  require_review_token "reviews:read"
+
+  _pages=0
+  while :; do
+    _q="$QUERY"
+    [ -n "$CURSOR" ] && _q="$_q&cursor=$(url_encode "$CURSOR")"
+    _url="$BASE_URL/api/reviews"
+    [ -n "$_q" ] && _url="$_url?${_q#&}"
+    review_api GET "$_url" || exit 2
+    print_json "$REVIEW_BODY"
+    [ "$ALL" -eq 1 ] || break
+
+    _next=$(next_cursor "$REVIEW_BODY")
+    [ -n "$_next" ] || break
+    if [ "$_next" = "$CURSOR" ]; then
+      echo "The server repeated the cursor '$_next'; stopping" >&2
+      exit 2
+    fi
+    _pages=$((_pages + 1))
+    [ "$_pages" -lt "$MAX_PAGES" ] || {
+      echo "Stopped after $MAX_PAGES pages; narrow the range with --since/--until" >&2
+      exit 2
+    }
+    CURSOR="$_next"
+  done
+  exit 0
+}
+
+run_reviews_show() {
+  ID=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --help|-h) reviews_usage_text; exit 0 ;;
+      --id) [ $# -ge 2 ] || reviews_usage; check_id "--id" "$2"; ID="$2"; shift 2 ;;
+      *) echo "Unknown argument: $1" >&2; reviews_usage ;;
+    esac
+  done
+  [ -n "$ID" ] || reviews_usage
+
+  require_review_token "reviews:read"
+  review_api GET "$BASE_URL/api/reviews/$ID" || exit 2
+  print_json "$REVIEW_BODY"
+  exit 0
+}
+
+# Collects the reply text into REPLY_TEXT from --text, --file (`-` is stdin)
+# or, when $1 is 1 and neither was given, from a piped stdin. Command
+# substitution drops trailing newlines, which a reply never wants anyway.
+read_reply_text() {
+  REPLY_TEXT=""; TEXT_FROM_STDIN=0
+  if [ "$TEXT_SET" -eq 1 ] && [ -n "$FILE" ]; then
+    echo "--text and --file cannot be combined" >&2
+    exit 1
+  fi
+  if [ "$TEXT_SET" -eq 1 ]; then REPLY_TEXT="$TEXT"; return 0; fi
+  if [ "$FILE" = "-" ]; then REPLY_TEXT=$(cat); TEXT_FROM_STDIN=1; return 0; fi
+  if [ -n "$FILE" ]; then
+    [ -f "$FILE" ] || { echo "Cannot read --file '$FILE'" >&2; exit 1; }
+    REPLY_TEXT=$(cat -- "$FILE") || exit 1
+    return 0
+  fi
+  if [ "$1" -eq 1 ] && [ ! -t 0 ]; then
+    REPLY_TEXT=$(cat); TEXT_FROM_STDIN=1
+  fi
+}
+
+reply_body_json() {
+  printf '{"body":"%s"}' "$(json_escape "$1")"
+}
+
+run_reviews_draft() {
+  ID=""; TEXT=""; TEXT_SET=0; FILE=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --help|-h) reviews_usage_text; exit 0 ;;
+      --id) [ $# -ge 2 ] || reviews_usage; check_id "--id" "$2"; ID="$2"; shift 2 ;;
+      --text) [ $# -ge 2 ] || reviews_usage; TEXT="$2"; TEXT_SET=1; shift 2 ;;
+      --file) [ $# -ge 2 ] || reviews_usage; FILE="$2"; shift 2 ;;
+      *) echo "Unknown argument: $1" >&2; reviews_usage ;;
+    esac
+  done
+  [ -n "$ID" ] || reviews_usage
+  read_reply_text 1
+  [ -n "$REPLY_TEXT" ] || {
+    echo "The reply text is empty: pass --text, --file, or pipe it on stdin" >&2
+    exit 1
+  }
+
+  require_review_token "reviews:reply"
+  review_api POST "$BASE_URL/api/reviews/$ID/draft" "$(reply_body_json "$REPLY_TEXT")" || exit 2
+  print_json "$REVIEW_BODY"
+  exit 0
+}
+
+run_reviews_publish() {
+  ID=""; TEXT=""; TEXT_SET=0; FILE=""; YES=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --help|-h) reviews_usage_text; exit 0 ;;
+      --id) [ $# -ge 2 ] || reviews_usage; check_id "--id" "$2"; ID="$2"; shift 2 ;;
+      --text) [ $# -ge 2 ] || reviews_usage; TEXT="$2"; TEXT_SET=1; shift 2 ;;
+      --file) [ $# -ge 2 ] || reviews_usage; FILE="$2"; shift 2 ;;
+      --yes) YES=1; shift ;;
+      *) echo "Unknown argument: $1" >&2; reviews_usage ;;
+    esac
+  done
+  [ -n "$ID" ] || reviews_usage
+  read_reply_text 0
+  if [ "$TEXT_SET" -eq 1 ] || [ -n "$FILE" ]; then
+    [ -n "$REPLY_TEXT" ] || { echo "The reply text is empty" >&2; exit 1; }
+  fi
+
+  require_review_token "reviews:publish"
+
+  if [ "$YES" -ne 1 ]; then
+    [ -t 0 ] || {
+      echo "Publishing reaches real users, so it needs a confirmation: run this on a terminal, or pass --yes" >&2
+      exit 1
+    }
+    [ "$TEXT_FROM_STDIN" -eq 0 ] || {
+      echo "The text came from stdin, so there is no terminal to ask on: pass --yes" >&2
+      exit 1
+    }
+    printf "Publish this reply to review %s? It goes to the store and reaches real users. [y/N] " "$ID"
+    read -r answer
+    case "$answer" in y|Y|yes|YES) ;; *) echo "Aborted." >&2; exit 1 ;; esac
+  fi
+
+  _body="{}"
+  [ -n "$REPLY_TEXT" ] && _body=$(reply_body_json "$REPLY_TEXT")
+  review_api POST "$BASE_URL/api/reviews/$ID/publish" "$_body" || exit 2
+  echo "Published the reply to review $ID: it is on its way to the store and reaches real users." >&2
+  print_json "$REVIEW_BODY"
+  exit 0
+}
+
+run_reviews() {
+  case "${1:-}" in
+    list) shift; run_reviews_list "$@" ;;
+    show) shift; run_reviews_show "$@" ;;
+    draft) shift; run_reviews_draft "$@" ;;
+    publish) shift; run_reviews_publish "$@" ;;
+    login) shift; run_reviews_login "$@" ;;
+    logout) shift; run_reviews_logout "$@" ;;
+    --help|-h|help) reviews_usage_text; exit 0 ;;
+    *) reviews_usage ;;
+  esac
+}
+
+apps_usage_text() {
+  echo "Usage: $SELF apps            lists the organization's apps (needs reviews:read)"
+}
+
+run_apps() {
+  [ "${1:-}" = "list" ] && shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --help|-h) apps_usage_text; exit 0 ;;
+      *) echo "Unknown argument: $1" >&2; apps_usage_text >&2; exit 1 ;;
+    esac
+  done
+  require_review_token "reviews:read"
+  review_api GET "$BASE_URL/api/apps" || exit 2
+  print_json "$REVIEW_BODY"
+  exit 0
+}
+
+insights_usage_text() {
+  echo "Usage: $SELF insights list --app <id> [--since <date>]    (needs reviews:read)"
+  echo "       The clustered review themes of one app, with their evidence."
+}
+
+run_insights() {
+  APP=""; QUERY=""
+  case "${1:-}" in
+    list) shift ;;
+    --help|-h|help) insights_usage_text; exit 0 ;;
+    *) insights_usage_text >&2; exit 1 ;;
+  esac
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --help|-h) insights_usage_text; exit 0 ;;
+      --app) [ $# -ge 2 ] || { insights_usage_text >&2; exit 1; }; check_id "--app" "$2"; APP="$2"; shift 2 ;;
+      --since)
+        [ $# -ge 2 ] || { insights_usage_text >&2; exit 1; }
+        check_date "--since" "$2"
+        QUERY="&since=$(url_encode "$2")"; shift 2 ;;
+      *) echo "Unknown argument: $1" >&2; insights_usage_text >&2; exit 1 ;;
+    esac
+  done
+  [ -n "$APP" ] || { echo "--app is required" >&2; insights_usage_text >&2; exit 1; }
+
+  require_review_token "reviews:read"
+  review_api GET "$BASE_URL/api/insights?app=$APP$QUERY" || exit 2
+  print_json "$REVIEW_BODY"
+  exit 0
+}
+
+ratings_usage_text() {
+  echo "Usage: $SELF ratings --app <id>    (needs reviews:read)"
+  echo "       Per-country rating histograms and the timeline of one app."
+}
+
+run_ratings() {
+  APP=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --help|-h|help) ratings_usage_text; exit 0 ;;
+      --app) [ $# -ge 2 ] || { ratings_usage_text >&2; exit 1; }; check_id "--app" "$2"; APP="$2"; shift 2 ;;
+      *) echo "Unknown argument: $1" >&2; ratings_usage_text >&2; exit 1 ;;
+    esac
+  done
+  [ -n "$APP" ] || { echo "--app is required" >&2; ratings_usage_text >&2; exit 1; }
+
+  require_review_token "reviews:read"
+  review_api GET "$BASE_URL/api/ratings?app=$APP" || exit 2
+  print_json "$REVIEW_BODY"
+  exit 0
+}
+
+usage_text() {
+  echo "Usage: $SELF ${NS_PREFIX}login [--project <slug>]   |   $SELF ${NS_PREFIX}logout [--project <slug>]"
+  echo "       $SELF ${NS_PREFIX}sync --project <slug> --out-dir <dir> [--no-comments] [--platform <ios|android|api>]"
+  echo "       $SELF ${NS_PREFIX}pull --project <slug> --locale <code> --format <fmt> [--tag <name>] [--out <path>]"
+  echo "       $SELF ${NS_PREFIX}keys <list|create|update|delete> --project <slug> [options]"
+  echo "       $SELF ${NS_PREFIX}values <get|set> --project <slug> --name <key> [--value <locale>=<text>]..."
+  echo "       $SELF ${NS_PREFIX}tags list --project <slug>"
+  if [ -n "$NS_PREFIX" ]; then
+    echo "       $SELF apps"
+    echo "       $SELF reviews <list|show|draft|publish|login|logout> [options]"
+    echo "       $SELF insights list --app <id> [--since <date>]"
+    echo "       $SELF ratings --app <id>"
+    echo "       $SELF <command> --help"
+  fi
+  echo "       $SELF --version"
+}
 
 usage() {
-  echo "Usage: $SELF ${NS_PREFIX}login [--project <slug>]   |   $SELF ${NS_PREFIX}logout [--project <slug>]" >&2
-  echo "       $SELF ${NS_PREFIX}sync --project <slug> --out-dir <dir> [--no-comments] [--platform <ios|android|api>]" >&2
-  echo "       $SELF ${NS_PREFIX}pull --project <slug> --locale <code> --format <fmt> [--tag <name>] [--out <path>]" >&2
-  echo "       $SELF ${NS_PREFIX}keys <list|create|update|delete> --project <slug> [options]" >&2
-  echo "       $SELF ${NS_PREFIX}values <get|set> --project <slug> --name <key> [--value <locale>=<text>]..." >&2
-  echo "       $SELF ${NS_PREFIX}tags list --project <slug>" >&2
-  echo "       $SELF --version" >&2
+  usage_text >&2
   exit 1
 }
 
@@ -824,13 +1352,12 @@ run_sync() {
   COMMENTS_PARAM=""
   [ "$NO_COMMENTS" -eq 1 ] && COMMENTS_PARAM="&comments=0"
 
-  AUTH="Authorization: Bearer $TOKEN"
 
   # One authenticated GET; -f turns HTTP errors into a non-zero exit so a bad
   # token or unknown project stops the run instead of writing an error body
   # into a .strings file.
   fetch() {
-    curl -fsS -A "$USER_AGENT" -H "$AUTH" "$1"
+    curl_auth -fsS -A "$USER_AGENT" "$1"
   }
 
   LISTING=$(fetch "$BASE_URL/api/loc/locales?project=$PROJECT&plain=1$PLATFORM_PARAM") || {
@@ -966,16 +1493,22 @@ if [ -z "$NS_PREFIX" ]; then
   case "${1:-}" in
     loc) shift; dispatch_loc "$@" ;;
     login|logout|sync|pull|keys|values|tags) dispatch_loc "$@" ;;
+    apps|reviews|insights|ratings)
+      echo "Reviews are not part of anylocale: the '$1' commands belong to the countrymanager CLI (https://countrymanager.app)." >&2
+      exit 1
+      ;;
+    --help|-h|help) usage_text; exit 0 ;;
     *) run_sync "$@" ;;
   esac
 else
   case "${1:-}" in
     loc) shift; dispatch_loc "$@" ;;
     login|logout|keys) dispatch_loc "$@" ;;
-    reviews)
-      echo "The reviews commands are not available yet; loc is the first namespace." >&2
-      exit 1
-      ;;
+    apps) shift; run_apps "$@" ;;
+    reviews) shift; run_reviews "$@" ;;
+    insights) shift; run_insights "$@" ;;
+    ratings) shift; run_ratings "$@" ;;
+    --help|-h|help) usage_text; exit 0 ;;
     *) run_sync "$@" ;;
   esac
 fi

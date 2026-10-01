@@ -1,9 +1,9 @@
 class Anylocale < Formula
   desc "Pull and push localized strings from anylocale"
   homepage "https://anylocale.com"
-  url "https://github.com/anylocale/cli/releases/download/v1.8.0/anylocale"
-  sha256 "8693c40272ac8a68cada7e719e53f78d6f12f892dd9569c6b97e16a0752c07f7"
-  version "1.8.0"
+  url "https://github.com/anylocale/cli/releases/download/v1.9.0/anylocale"
+  sha256 "10f4fc6b4933e0326413f960a98ab49d3b72d686f9127f396c82cb7978d135b2"
+  version "1.9.0"
   license "MIT"
 
   def install

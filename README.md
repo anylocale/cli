@@ -4,7 +4,7 @@ The anylocale CLI: POSIX `sh` plus `curl`, nothing else. Vendor it into a
 repo, or install it and run it from CI, an Xcode build phase or an agent's
 shell.
 
-Version 1.8.0.
+Version 1.9.0.
 
 ## Install
 
